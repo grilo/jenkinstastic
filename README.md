@@ -29,6 +29,7 @@ The crawling is done recursively by inspecting "url" entries within the response
 The request to Jenkins is a simple GET request, requesting the api/json as response.
 
 The found data will then be POSTed to elasticsearch. An example:
+
 ```json
 {
   "testFailCount": 1, 
@@ -41,7 +42,8 @@ The found data will then be POSTed to elasticsearch. An example:
   "causes": "hudson.triggers.SCMTrigger$SCMTriggerCause,SomeUser", 
   "testTotalCount": 15, 
   "buildTimestamp": "2017-01-19T23:16:08"
-}```
+}
+```
 
 Each build entry found will have an unique ID depending on the following parameters:
  - Jenkins Host
@@ -54,6 +56,4 @@ potential amount of duplicate entries (which would otherwise contaminate your el
 instance).
 
 There is no strong coupling with elasticsearch, meaning that it's possible to point the
-utility to any HTTP API which fulfills the same contract:
-host:port/index/type/uid
-POST { key: value }
+utility to any HTTP API which fulfills the same contract.
