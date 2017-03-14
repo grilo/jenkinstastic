@@ -1,59 +1,103 @@
 #!/usr/bin/env python
 
-import urlparse
 import json
 import hashlib
 import datetime
 import logging
 import argparse
 import sys
+import signal
+import multiprocessing
 
 import requests
 
+def get_builds(url):
+    if not url.endswith('/'):
+        url += '/'
+    url += 'api/json?depth=2'
+    logging.debug('Requesting: %s', url)
+    data = requests.get(url).text
+    return json.loads(data)
 
-class Endpoint(object):
+class JenkinsClient(object):
 
     def __init__(self, url):
         if not url.endswith('/'):
-            url = url + '/'
-        self.url = url + 'api/json'
-        for k, v in self.__client(self.url).items():
-            self.__dict__[k] = v
+            url += '/'
+        self.url = url
 
-    def __client(self, url):
-        logging.debug('Requesting: %s', url)
+    def get_jobs(self):
+        url = self.url + 'api/json'
         data = requests.get(url).text
-        return json.loads(data)
-
-    def _get_urls(self, name, urls):
-        for item in urls:
-            obj = Endpoint(item['url'])
-            obj.__class__.__name__ = name
-            yield obj
-
-    def __getattribute__(self, name):
-        attribute = super(Endpoint, self).__getattribute__(name)
-        # Make sure we only intercept a very specific set of calls which
-        # enable the recursion into the resources which have an 'url' tag
-        # tag associated with them.
-        if isinstance(attribute, list) and \
-                len(attribute) and \
-                isinstance(attribute[0], dict) \
-                and 'url' in attribute[0].keys():
-            return self._get_urls(name, attribute)
-        return attribute
-
-    def __repr__(self):
-        string = [self.__class__.__name__]
-        for k, v in self.__dict__.items():
-            string.append('  %s: %s' % (k, v))
-        return '\n'.join(string) + '\n'
+        jobs = [job['url'] for job in json.loads(data)['jobs']]
+        logging.info('Found (%i) jobs from: %s', len(jobs), url)
+        return jobs
 
 
-def generate_build_uid(data):
-    h = hashlib.sha1()
-    h.update(data['host'] + data['job'] + str(data['buildNumber']) + str(data['buildTimestamp']))
-    return h.hexdigest()
+class JenkinsBuild(object):
+
+    def __init__(self, host, job_name, build):
+
+        props = {
+            'host': host,
+            'name': job_name,
+            'timestamp': datetime.datetime.utcfromtimestamp(build['timestamp'] / 1000).isoformat(),
+            'duration': build['duration'],
+            'number': build['number'],
+            'result': build['result'],
+            'causes': [],
+            'testTotalCount': 0,
+            'testSkipCount': 0,
+            'testFailCount': 0,
+        }
+
+        for action in build['actions']:
+            if 'causes' in action.keys():
+                for cause in action['causes']:
+                    true_cause = 'unknown'
+                    if 'userName' in cause.keys():
+                        true_cause = cause['userName']
+                    elif '_class' in cause.keys():
+                        true_cause = cause['_class']
+                    if not true_cause in props['causes']:
+                        props['causes'].append(true_cause)
+
+            if 'totalCount' in action.keys():
+                props['testTotalCount'] = action['totalCount']
+                props['testSkipCount'] = action['skipCount']
+                props['testFailCount'] = action['failCount']
+
+        if not props['causes']:
+            props['causes'].append('unknown')
+        props['causes'] = ','.join(props['causes'])
+
+        self.props = props
+
+    def __getattr__(self, name):
+        if name in self.props.keys():
+            return self.props[name]
+
+    def serialize(self):
+        return json.dumps(self.props, indent=2)
+
+
+class ElasticsearchClient(object):
+
+    def __init__(self, url):
+        if not url.endswith('/'):
+            url += '/'
+        self.url = url
+
+    def _uid(self, build):
+        h = hashlib.sha1()
+        h.update(build.host + build.name + str(build.number) + build.timestamp)
+        return h.hexdigest()
+
+    def post(self, build):
+        serialized = build.serialize()
+        logging.debug('POSTing: \n %s', serialized)
+        return requests.post(self.url + 'jenkins/builds/' + self._uid(build), data=serialized)
+
 
 
 def main():
@@ -86,56 +130,36 @@ def main():
     if not args.jenkins.startswith('http'):
         raise SystemExit('The Jenkins instance must start with http')
 
-    #args.jenkins = 'https://jenkins.mono-project.com'
-    args.jenkins = 'https://hub.spigotmc.org/jenkins'
+    elastic_client = ElasticsearchClient(args.elasticsearch)
+    jenkins_client = JenkinsClient(args.jenkins)
 
-    j = Endpoint(args.jenkins)
-    for job in j.jobs:
-        for build in job.builds:
+    def init_worker():
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    pool = multiprocessing.Pool(initializer=init_worker)
 
-            entry = {}
-            entry['host'] = urlparse.urlparse(j.url).netloc.split(':')[0]
-            entry['job'] = job.displayName
-            entry['buildTimestamp'] = datetime.datetime.utcfromtimestamp(build.timestamp / 1000).isoformat()
-            entry['buildDuration'] = build.duration
-            entry['buildNumber'] = build.number
-            entry['buildResult'] = build.result
-            entry['causes'] = []
-            entry['testTotalCount'] = 0
-            entry['testSkipCount'] = 0
-            entry['testFailCount'] = 0
+    try:
+        count = 0
+        for result in pool.imap_unordered(get_builds, jenkins_client.get_jobs()):
+            job_name = result['displayName']
+            logging.info('[%i] Builds found for (%s): %i', count, job_name, len(result['builds']))
+            for build in result['builds']:
+                jenkins_build = JenkinsBuild(args.jenkins, job_name, build)
+                response = elastic_client.post(jenkins_build)
+                status = 'created'
+                if response.status_code == 200:
+                    status = 'updated'
+                logging.debug('Job (%s/%s/%i) in elasticsearch: %s', \
+                    jenkins_build.host, \
+                    jenkins_build.name, \
+                    jenkins_build.number, status)
+            count += 1
+        pool.close()
+        pool.join()
+    except KeyboardInterrupt:
+        logging.critical('User requested termination.')
+        pool.terminate()
+        pool.join()
 
-            build_uid = generate_build_uid(entry)
-
-            for action in build.actions:
-                if 'causes' in action.keys():
-                    logging.debug('Found build triggers, appending to: %s', build_uid)
-                    for cause in action['causes']:
-                        if 'userName' in cause.keys():
-                            entry['causes'].append(cause['userName'])
-                        elif '_class' in cause.keys():
-                            entry['causes'].append(cause['_class'])
-
-                if 'totalCount' in action.keys():
-                    logging.debug('Found test results, appending to: %s', build_uid)
-                    entry['testTotalCount'] = action['totalCount']
-                    entry['testSkipCount'] = action['skipCount']
-                    entry['testFailCount'] = action['failCount']
-
-            if not entry['causes']:
-                entry['causes'].append('unknown')
-            entry['causes'] = ','.join(entry['causes'])
-
-            logging.debug('POSTing JSON')
-            logging.debug(json.dumps(entry, indent=2))
-            dump = json.dumps(entry)
-            response = requests.post(args.elasticsearch + '/jenkins/builds/' + build_uid, data=dump)
-            logging.debug('Elasticsearch code (%i): %s', response.status_code, response.text)
-            status = 'created'
-            if response.status_code == 200:
-                status = 'updated'
-
-            logging.info('Job (%s/%s/%i) in elasticsearch: %s', entry['host'], entry['job'], entry['buildNumber'], status)
 
 if __name__ == '__main__':
     main()
