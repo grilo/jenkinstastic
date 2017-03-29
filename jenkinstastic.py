@@ -1,103 +1,55 @@
 #!/usr/bin/env python
 
 import json
-import hashlib
-import datetime
 import logging
 import argparse
 import sys
 import signal
 import multiprocessing
+import os
 
 import requests
 
-def get_builds(url):
-    if not url.endswith('/'):
-        url += '/'
-    url += 'api/json?depth=2'
-    logging.debug('Requesting: %s', url)
-    data = requests.get(url).text
-    return json.loads(data)
-
-class JenkinsClient(object):
-
-    def __init__(self, url):
-        if not url.endswith('/'):
-            url += '/'
-        self.url = url
-
-    def get_jobs(self):
-        url = self.url + 'api/json'
-        data = requests.get(url).text
-        jobs = [job['url'] for job in json.loads(data)['jobs']]
-        logging.info('Found (%i) jobs from: %s', len(jobs), url)
-        return jobs
+import drivers
 
 
-class JenkinsBuild(object):
+def load_driver(path):
+    """Load a python module."""
+    if not path.endswith('.py'):
+        path += '.py'
+    if not os.path.isfile(path):
+        raise ImportError('Path must be a file: %s', path)
+    path = path.rstrip('.py')
+    directory = os.path.dirname(path)
+    if not directory in sys.path:
+        sys.path.insert(0, directory)
+    try:
+        return __import__(os.path.basename(path), globals(), locals(), [], -1)
+    except SyntaxError as exception:
+        raise exception
+    except ImportError as exception:
+        print exception
+        raise NotImplementedError("Unable to find requested module in path: %s" % (path))
 
-    def __init__(self, host, job_name, build):
-
-        props = {
-            'host': host,
-            'name': job_name,
-            'timestamp': datetime.datetime.utcfromtimestamp(build['timestamp'] / 1000).isoformat(),
-            'duration': build['duration'],
-            'number': build['number'],
-            'result': build['result'],
-            'causes': [],
-            'testTotalCount': 0,
-            'testSkipCount': 0,
-            'testFailCount': 0,
-        }
-
-        for action in build['actions']:
-            if 'causes' in action.keys():
-                for cause in action['causes']:
-                    true_cause = 'unknown'
-                    if 'userName' in cause.keys():
-                        true_cause = cause['userName']
-                    elif '_class' in cause.keys():
-                        true_cause = cause['_class']
-                    if not true_cause in props['causes']:
-                        props['causes'].append(true_cause)
-
-            if 'totalCount' in action.keys():
-                props['testTotalCount'] = action['totalCount']
-                props['testSkipCount'] = action['skipCount']
-                props['testFailCount'] = action['failCount']
-
-        if not props['causes']:
-            props['causes'].append('unknown')
-        props['causes'] = ','.join(props['causes'])
-
-        self.props = props
-
-    def __getattr__(self, name):
-        if name in self.props.keys():
-            return self.props[name]
-
-    def serialize(self):
-        return json.dumps(self.props, indent=2)
-
-
-class ElasticsearchClient(object):
-
-    def __init__(self, url):
-        if not url.endswith('/'):
-            url += '/'
-        self.url = url
-
-    def _uid(self, build):
-        h = hashlib.sha1()
-        h.update(build.host + build.name + str(build.number) + build.timestamp)
-        return h.hexdigest()
-
-    def post(self, build):
-        serialized = build.serialize()
-        logging.debug('POSTing: \n %s', serialized)
-        return requests.post(self.url + 'jenkins/builds/' + self._uid(build), data=serialized)
-
+def get_resume_id(elasticsearch_url, driver_name):
+    query = {
+        "query": {
+            "match_all": {}
+        },
+        "sort": [
+            { "timestamp":
+                { "order": "desc" }
+            },
+        ],
+        "size": 1
+    }
+    response = requests.get(elasticsearch_url + '/' + driver_name + '/_search', data=json.dumps(query))
+    if not response.ok:
+        logging.warning('No resume id found, starting from scratch.')
+        return ''
+    resume_id = json.loads(response.text)['hits']['hits'][0]['_id']
+    logging.info('Found resume id: %s', resume_id)
+    return resume_id
 
 
 def main():
@@ -105,15 +57,19 @@ def main():
     if sys.version_info < (2,6) or sys.version_info > (2,8):
         raise SystemExit('Sorry, this code needs Python 2.6 or Python 2.7 (current: %s.%s)' % (sys.version_info[0], sys.version_info[1]))
 
-    desc = 'Crawls a Jenkins instance and posts data to elasticsearch.'
+    desc = 'Extracts data using the multiple drivers and posts data to elasticsearch.'
     parser = argparse.ArgumentParser(description=desc)
 
     parser.add_argument('-v', '--verbose', action='store_true', \
         help='Increase output verbosity')
     parser.add_argument('-e', '--elasticsearch', default='http://localhost:9200', \
         help='The Elasticsearch instance where the build info will be POSTed to.')
-    parser.add_argument('-j', '--jenkins', default='http://localhost:9090', \
-        help='The Jenkins instance to be crawled for build information.')
+    parser.add_argument('-d', '--driver', required=True, help='The driver to use when parsing the URL.')
+    parser.add_argument('-l', '--location', required=True, help='The URL to crawl for data.')
+    parser.add_argument('-u', '--username', \
+        help='The username for driver service authentication.')
+    parser.add_argument('-p', '--password', \
+        help='The password for driver service authentication.')
 
     args = parser.parse_args()
 
@@ -127,11 +83,16 @@ def main():
     # Sanity check
     if not args.elasticsearch.startswith('http'):
         raise SystemExit('The Elasticsearch instance must start with http')
-    if not args.jenkins.startswith('http'):
-        raise SystemExit('The Jenkins instance must start with http')
 
-    elastic_client = ElasticsearchClient(args.elasticsearch)
-    jenkins_client = JenkinsClient(args.jenkins)
+    # Obtain the resume point (if there's already data on the destination)
+    resume_id = get_resume_id(args.elasticsearch, args.driver)
+
+    # Initialize the requested driver
+    module_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'drivers', args.driver)
+    driver = load_driver(module_path)
+
+    # Prepare the elasticsearch client
+    args.elasticsearch += '/' + args.driver + '/' + driver.get_type()
 
     def init_worker():
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -139,20 +100,22 @@ def main():
 
     try:
         count = 0
-        for result in pool.imap_unordered(get_builds, jenkins_client.get_jobs()):
-            job_name = result['displayName']
-            logging.info('[%i] Builds found for (%s): %i', count, job_name, len(result['builds']))
-            for build in result['builds']:
-                jenkins_build = JenkinsBuild(args.jenkins, job_name, build)
-                response = elastic_client.post(jenkins_build)
-                status = 'created'
-                if response.status_code == 200:
-                    status = 'updated'
-                logging.debug('Job (%s/%s/%i) in elasticsearch: %s', \
-                    jenkins_build.host, \
-                    jenkins_build.name, \
-                    jenkins_build.number, status)
-            count += 1
+        for task_results in pool.imap_unordered(driver.process_task, driver.get_tasks(args.location, args.username, args.password, resume_id)):
+            # Post the results to the elastic search instance
+            if isinstance(task_results, list):
+                for result in task_results:
+                    # The ID field is meant to avoid duplicates
+                    url = args.elasticsearch
+                    if 'id' in result.keys():
+                        url += '/' + result['id']
+                    requests.post(url, data=json.dumps(result))
+            elif isinstance(task_results, dict):
+                url = args.elasticsearch
+                if 'id' in task_results.keys():
+                    url += '/' + task_results['id']
+                requests.post(url, data=json.dumps(task_results))
+            else:
+                raise NotImplementedError('Task processing should return a list or a dict.')
         pool.close()
         pool.join()
     except KeyboardInterrupt:

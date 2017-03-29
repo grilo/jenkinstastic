@@ -1,9 +1,13 @@
 # jenkinstastic
-Crawl a jenkins instance and feed build data to an elasticsearch cluster.
+Collects data from a service instance and feeds the data to an elasticsearch cluster.
 
 ## Usage
 ```bash
-python jenkinstastic.py -j http://jenkins.company.com:9000 -e http://elasticsearch.company.com:9200
+python main.py -d <driver> -l <service url>
+
+python main.py -d jenkins -l https://your.jenkins.instance
+
+python main.py -d git -l https://your.git.instance
 ```
 
 ## Why
